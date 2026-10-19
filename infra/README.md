@@ -18,9 +18,7 @@ infra/
 └── README.md                        # Este arquivo
 
 .github/workflows/
-├── backend.yml                      # CI: lint (ruff) + test (pytest) + build Docker
-├── frontend.yml                     # CI: lint (eslint) + build (vite) + build Docker
-└── deploy.yml                       # CD: push ACR + deploy Azure App Service
+└── ci.yml                           # CI + CD (deploy-prod com aprovação e rollback)
 ```
 
 ---
@@ -83,46 +81,26 @@ docker compose -f docker-compose.prod.yml down -v
 
 ## CI/CD — GitHub Actions
 
-### Pipelines
+Um único workflow, `.github/workflows/ci.yml`:
 
-1. **Backend CI** (`backend.yml`) — dispara em push/PR que altera `backend/**`
-   - Lint com **ruff** (check + format)
-   - Testes com **pytest** (com PostgreSQL service)
-   - Build da imagem Docker (somente em push na main)
+| Job | Quando | Bloqueante |
+|-----|--------|:----------:|
+| `backend-tests` (pytest) | PR e push em `dev`/`main` | ✅ |
+| `migrations` (alembic em Postgres limpo) | idem | ✅ |
+| `frontend-build` (vite) | idem | ✅ |
+| `docker-build` (imagem do backend) | idem | ✅ |
+| `frontend-quality` (eslint + vitest) | idem | ❌ (informativo) |
+| `deploy-prod` | só push em `main` | exige aprovação manual |
 
-2. **Frontend CI** (`frontend.yml`) — dispara em push/PR que altera `frontend/**`
-   - Lint com **ESLint**
-   - Build com **Vite** (valida que compila)
-   - Build da imagem Docker (somente em push na main)
+`deploy-prod` roda no Environment `production`: após a aprovação faz SSH na VM,
+`git pull` + `docker compose up -d --build`, valida `/health` e, se falhar, volta
+para o commit anterior. O rollback reverte o **código**, não o banco.
 
-3. **Deploy** (`deploy.yml`) — dispara após CI passar na main
-   - Build e push de ambas as imagens para Azure Container Registry
-   - Deploy para Azure App Service
+Secrets (Settings → Secrets → Actions): `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`,
+`DEPLOY_PATH` (opcional `SSH_PORT`). Variável opcional: `HEALTH_URL`.
 
-### Secrets Necessários no GitHub
-
-| Secret | Descrição |
-|--------|-----------|
-| `AZURE_CREDENTIALS` | JSON do service principal (`az ad sp create-for-rbac`) |
-| `ACR_LOGIN_SERVER` | URL do ACR (ex: `cloudatlas.azurecr.io`) |
-| `ACR_USERNAME` | Username do ACR |
-| `ACR_PASSWORD` | Password do ACR |
-| `AZURE_RESOURCE_GROUP` | Resource group no Azure |
-
-### Configurar Azure Container Registry
-
-```bash
-# Criar ACR
-az acr create --resource-group <rg> --name cloudatlas --sku Basic
-
-# Criar service principal com acesso ao ACR
-az ad sp create-for-rbac --name "cloudatlas-ci" \
-  --role contributor \
-  --scopes /subscriptions/<sub-id>/resourceGroups/<rg> \
-  --sdk-auth
-```
-
-O JSON retornado vai no secret `AZURE_CREDENTIALS`.
+Provisionamento da VM do zero, DNS, secrets, acesso ao monitoramento e backup:
+veja o **[RUNBOOK.md](RUNBOOK.md)**.
 
 ---
 

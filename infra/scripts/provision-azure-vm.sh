@@ -1,104 +1,99 @@
 #!/usr/bin/env bash
 # =============================================================================
-# CloudAtlas — Provisionamento da VM Azure
-# Execute este script UMA ÚNICA VEZ na sua máquina local com az CLI instalado
-# Pré-requisito: az login
+# CloudAtlas — Provisiona a VM de produção no Azure
+#
+# Rode na SUA máquina, uma única vez, com o az CLI instalado e `az login` feito.
+#   bash infra/scripts/provision-azure-vm.sh
+#
+# O que faz: resource group, VM Ubuntu 22.04 com IP estático, portas 80/443,
+# chave SSH dedicada ao deploy e execução do bootstrap-vm.sh dentro da VM.
+# Cria recursos pagos: o script mostra a assinatura e pede confirmação.
+#
+# Todas as variáveis abaixo podem ser sobrescritas pelo ambiente.
 # =============================================================================
 set -euo pipefail
 
-# ── Configurações (edite conforme necessário) ─────────────────────────────────
-RESOURCE_GROUP="cloudatlas-rg"
-LOCATION="brazilsouth"
-VM_NAME="cloudatlas-vm"
-VM_SIZE="Standard_B2s"       # 2 vCPUs, 4 GB RAM — ~$30/mês
-VM_USER="cloudatlas"
-REPO_URL="https://github.com/HigorHenrique4tech/cloud-hub-manager.git"
-APP_DIR="/app/cloud-hub-manager"
+RESOURCE_GROUP="${RESOURCE_GROUP:-cloudatlas-rg}"
+LOCATION="${LOCATION:-brazilsouth}"
+VM_NAME="${VM_NAME:-cloudatlas-vm}"
+VM_SIZE="${VM_SIZE:-Standard_B2ms}"      # 2 vCPU, 8 GB RAM
+VM_USER="${VM_USER:-cloudatlas}"
+OS_DISK_GB="${OS_DISK_GB:-64}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/cloudatlas_deploy}"   # chave dedicada, não reaproveita a pessoal
 
-# ─────────────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "==> [1/6] Criando Resource Group: $RESOURCE_GROUP"
-az group create \
-  --name "$RESOURCE_GROUP" \
-  --location "$LOCATION" \
-  --output table
+command -v az >/dev/null || { echo "az CLI não encontrado."; exit 1; }
+az account show >/dev/null 2>&1 || { echo "Faça 'az login' antes de rodar."; exit 1; }
 
-echo "==> [2/6] Criando VM: $VM_NAME ($VM_SIZE)"
+echo "Assinatura : $(az account show --query name -o tsv) ($(az account show --query id -o tsv))"
+echo "Criará     : grupo $RESOURCE_GROUP, VM $VM_NAME ($VM_SIZE) em $LOCATION, disco ${OS_DISK_GB} GB"
+if [ "${YES:-0}" != "1" ]; then
+  read -r -p "Continuar? [s/N] " ans
+  [[ "$ans" =~ ^[sSyY]$ ]] || { echo "Cancelado."; exit 1; }
+fi
+
+# ── Chave SSH dedicada ───────────────────────────────────────────────────────
+if [ ! -f "$SSH_KEY" ]; then
+  echo "==> Gerando chave SSH dedicada: $SSH_KEY"
+  ssh-keygen -t ed25519 -N "" -C "cloudatlas-deploy" -f "$SSH_KEY"
+fi
+
+echo "==> [1/5] Resource group"
+az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
+
+echo "==> [2/5] VM (IP público estático)"
 az vm create \
   --resource-group "$RESOURCE_GROUP" \
   --name "$VM_NAME" \
   --image Ubuntu2204 \
   --size "$VM_SIZE" \
+  --os-disk-size-gb "$OS_DISK_GB" \
   --admin-username "$VM_USER" \
-  --generate-ssh-keys \
-  --output table
+  --authentication-type ssh \
+  --ssh-key-values "${SSH_KEY}.pub" \
+  --public-ip-sku Standard \
+  --public-ip-address-allocation static \
+  --output none
 
-# Captura IP público
-VM_IP=$(az vm show \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$VM_NAME" \
-  --show-details \
-  --query publicIps \
-  --output tsv)
+VM_IP=$(az vm show -d --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --query publicIps -o tsv)
+echo "    IP: $VM_IP"
 
-echo "==> IP da VM: $VM_IP"
+echo "==> [3/5] Liberando 80 e 443 no NSG (22 já vem liberado; ssh só com chave)"
+az vm open-port --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" \
+  --port 80,443 --priority 1010 --output none
 
-echo "==> [3/6] Liberando portas 80 (HTTP) e 443 (HTTPS)"
-az vm open-port \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$VM_NAME" \
-  --port 80,443 \
-  --priority 100 \
-  --output table
+SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
-echo "==> [4/6] Instalando Docker na VM"
-ssh -o StrictHostKeyChecking=no "$VM_USER@$VM_IP" bash <<'REMOTE'
-set -euo pipefail
-# Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
+echo "==> [4/5] Aguardando SSH"
+for i in $(seq 1 30); do
+  ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_IP" true 2>/dev/null && break
+  [ "$i" = 30 ] && { echo "SSH não respondeu a tempo."; exit 1; }
+  sleep 5
+done
 
-# Docker Compose plugin (via apt)
-sudo apt-get install -y docker-compose-plugin
+echo "==> [5/5] Executando bootstrap dentro da VM"
+scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/bootstrap-vm.sh" "$VM_USER@$VM_IP:/tmp/bootstrap-vm.sh"
+ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_IP" "sudo DEPLOY_USER=$VM_USER bash /tmp/bootstrap-vm.sh"
 
-# Git (normalmente já instalado)
-sudo apt-get install -y git
-REMOTE
+cat <<EOF
 
-echo "==> [5/6] Clonando repositório"
-ssh "$VM_USER@$VM_IP" bash <<REMOTE
-set -euo pipefail
-sudo mkdir -p /app
-sudo chown $VM_USER:$VM_USER /app
-git clone $REPO_URL $APP_DIR
-REMOTE
+============================================================
+ VM provisionada
+============================================================
+ IP público : $VM_IP
+ SSH        : ssh -i $SSH_KEY $VM_USER@$VM_IP
 
-echo "==> [6/6] Criando arquivo .env a partir do template"
-ssh "$VM_USER@$VM_IP" bash <<REMOTE
-cp $APP_DIR/.env.example $APP_DIR/.env
-echo ""
-echo "ATENÇÃO: edite o arquivo de ambiente antes de subir os containers:"
-echo "  ssh $VM_USER@$VM_IP"
-echo "  nano $APP_DIR/.env"
-REMOTE
-
-# ── Resumo ────────────────────────────────────────────────────────────────────
-echo ""
-echo "============================================================"
-echo " VM provisionada com sucesso!"
-echo "============================================================"
-echo " IP público : $VM_IP"
-echo " SSH        : ssh $VM_USER@$VM_IP"
-echo " App dir    : $APP_DIR"
-echo ""
-echo " Próximos passos:"
-echo "  1. Apontar DNS: cloudatlas.app.br → $VM_IP  (registro A)"
-echo "  2. Editar .env na VM: ssh $VM_USER@$VM_IP && nano $APP_DIR/.env"
-echo "  3. Adicionar secrets no GitHub Actions:"
-echo "     VM_HOST    = $VM_IP"
-echo "     VM_SSH_KEY = (conteúdo de ~/.ssh/id_rsa)"
-echo "  4. Subir os containers:"
-echo "     ssh $VM_USER@$VM_IP"
-echo "     cd $APP_DIR/infra"
-echo "     docker compose -f docker-compose.prod.yml up -d --build"
-echo "============================================================"
+ Próximos passos (detalhes em infra/RUNBOOK.md):
+  1. DNS — registros A apontando para $VM_IP:
+       cloudatlas.app.br, www, hub, desk
+  2. Secrets do GitHub (Settings > Secrets > Actions):
+       SSH_HOST=$VM_IP   SSH_USER=$VM_USER
+       SSH_PRIVATE_KEY=<conteúdo de $SSH_KEY>
+       DEPLOY_PATH=/app/cloudatlas
+  3. Preencha OAuth em /app/cloudatlas/infra/.env (na VM) e faça backup
+     da ENCRYPTION_KEY gerada.
+  4. Primeiro start (só depois do DNS propagar):
+       cd /app/cloudatlas && docker compose -f infra/docker-compose.prod.yml up -d --build
+============================================================
+EOF
