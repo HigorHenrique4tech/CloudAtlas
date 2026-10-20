@@ -1,0 +1,237 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline de Integração Contínua do CloudAtlas.
+#
+# Roda a cada PR e push em dev/main. Replica, num ambiente limpo, os 4 lugares
+# onde o projeto quebra: testes backend, migrations, build do frontend e build
+# da imagem Docker. Cada job existe por causa de um bug real já vivido.
+#
+# Jobs BLOQUEANTES (falha = PR não faz merge, se branch protection estiver ativo):
+#   - backend-tests   : suíte pytest (128 verdes)
+#   - migrations      : alembic upgrade head num Postgres LIMPO + cabeça única
+#   - frontend-build  : vite build
+#   - docker-build    : build da imagem do backend (pega CRLF/entrypoint/deps)
+#
+# Jobs INFORMATIVOS (continue-on-error — não bloqueiam ainda):
+#   - frontend-quality: eslint + vitest (promover a bloqueante após configurar
+#                       o ambiente jsdom do vitest e zerar os warnings do eslint)
+#
+# CD (deploy-prod): só em push na main, após os 4 bloqueantes passarem E após
+# aprovação manual no Environment "production". Faz healthcheck e, se falhar,
+# executa rollback automático para o commit anterior.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+# Cancela execuções antigas do mesmo PR/branch quando um novo push chega.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Testes do backend (pytest, SQLite in-memory via conftest) ───────────────
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # mesma versão do container (3.14 quebra wheels)
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Instalar dependências
+        run: pip install -r backend/requirements.txt
+      - name: pytest
+        working-directory: backend
+        run: pytest -q --tb=short
+
+  # ── Migrations num Postgres limpo (pega o crash-loop de migration) ──────────
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ca
+          POSTGRES_PASSWORD: ca
+          POSTGRES_DB: ca_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DEBUG: "True"
+      SECRET_KEY: "ci-secret-key-not-used-in-prod"
+      DATABASE_URL: "postgresql://ca:ca@localhost:5432/ca_test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Instalar dependências
+        run: pip install -r backend/requirements.txt
+      - name: Cadeia Alembic deve ter uma única cabeça
+        working-directory: backend
+        run: |
+          alembic heads
+          count=$(alembic heads | grep -cE '\S')
+          echo "cabeças encontradas: $count"
+          test "$count" -eq 1
+      - name: Migrar do zero (alembic upgrade head)
+        working-directory: backend
+        run: alembic upgrade head
+
+  # ── Build do frontend (pega erros de import/JSX) ────────────────────────────
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Instalar dependências
+        working-directory: frontend
+        run: npm ci
+      - name: vite build
+        working-directory: frontend
+        run: npm run build
+
+  # ── Build da imagem Docker do backend (pega CRLF no entrypoint, deps) ───────
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build (backend)
+        run: docker build -t cloudatlas-backend:ci ./backend
+
+  # ── Qualidade do frontend (informativo — não bloqueia por enquanto) ─────────
+  frontend-quality:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # TODO: remover quando vitest (jsdom) + eslint estiverem verdes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Instalar dependências
+        working-directory: frontend
+        run: npm ci
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+      - name: vitest
+        working-directory: frontend
+        run: npm test
+
+  # ── CD: deploy em produção (VM Azure, docker compose) ───────────────────────
+  # Só roda em push na main (pós-merge), SOMENTE se os 4 jobs bloqueantes
+  # passaram (needs), e AINDA assim aguarda aprovação manual — o GitHub pausa
+  # aqui até um revisor aprovar no Environment "production".
+  #
+  # Secrets necessários (Settings → Secrets and variables → Actions):
+  #   SSH_PRIVATE_KEY : chave privada com acesso à VM (a pública vai no
+  #                     ~/.ssh/authorized_keys do servidor)
+  #   SSH_HOST        : IP ou hostname da VM
+  #   SSH_USER        : usuário SSH
+  #   DEPLOY_PATH     : caminho do repositório no servidor (ex: /opt/cloudatlas)
+  #   SSH_PORT        : (opcional) porta SSH — assume 22 se não definido
+  # Variável opcional (aba Variables):
+  #   HEALTH_URL      : URL do healthcheck (default: https://hub.cloudatlas.app.br/health)
+  deploy-prod:
+    needs: [backend-tests, migrations, frontend-build, docker-build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production   # ← exige aprovação manual (configurar reviewers)
+    steps:
+      - name: Preparar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H -p "${{ secrets.SSH_PORT || 22 }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # Guarda o commit atualmente em produção — é para ele que voltamos se algo falhar.
+      - name: Capturar versão atual (ponto de rollback)
+        id: prev
+        run: |
+          SHA=$(ssh -i ~/.ssh/deploy_key -p "${{ secrets.SSH_PORT || 22 }}" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "cd '${{ secrets.DEPLOY_PATH }}' && git rev-parse HEAD")
+          echo "Versão atual em produção: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (git pull + docker compose up)
+        id: deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.SSH_PORT || 22 }}" \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "set -e && \
+             cd '${{ secrets.DEPLOY_PATH }}' && \
+             git fetch --all --prune && \
+             git checkout main && \
+             git pull origin main && \
+             docker compose -f infra/docker-compose.prod.yml up -d --build && \
+             docker image prune -f"
+
+      - name: Smoke test (/health)
+        id: health
+        run: |
+          URL="${{ vars.HEALTH_URL || 'https://hub.cloudatlas.app.br/health' }}"
+          echo "Verificando $URL"
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
+            echo "tentativa $i: HTTP $code"
+            if [ "$code" = "200" ]; then echo "Aplicação saudável."; exit 0; fi
+            sleep 10
+          done
+          echo "::error::Healthcheck não retornou 200 após o deploy."
+          exit 1
+
+      # ── Rollback automático ───────────────────────────────────────────────
+      # Dispara se o deploy OU o healthcheck falharem: volta o código para o
+      # commit anterior e reconstrói.
+      #
+      # ⚠️ LIMITAÇÃO IMPORTANTE: isto reverte o CÓDIGO, não o BANCO. Se o deploy
+      # aplicou uma migration (o entrypoint roda `alembic upgrade head`), o schema
+      # continua na versão nova enquanto o código volta para a antiga. Para deploys
+      # com migration destrutiva, faça restore do backup manualmente.
+      - name: Rollback para a versão anterior
+        if: failure() && steps.prev.outputs.sha != ''
+        run: |
+          echo "::warning::Deploy falhou — revertendo para ${{ steps.prev.outputs.sha }}"
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.SSH_PORT || 22 }}" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "set -e && \
+             cd '${{ secrets.DEPLOY_PATH }}' && \
+             git checkout ${{ steps.prev.outputs.sha }} && \
+             docker compose -f infra/docker-compose.prod.yml up -d --build"
+
+      - name: Verificar saúde após rollback
+        if: failure() && steps.prev.outputs.sha != ''
+        run: |
+          URL="${{ vars.HEALTH_URL || 'https://hub.cloudatlas.app.br/health' }}"
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
+            echo "pós-rollback tentativa $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "::notice::Rollback concluído — produção restaurada na versão anterior."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Rollback executado mas a aplicação segue fora do ar. Intervenção manual necessária."
+          exit 1

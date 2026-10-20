@@ -5,8 +5,9 @@ RUN apk add --no-cache python3 py3-pip bash gzip && \
     pip3 install --no-cache-dir --break-system-packages azure-storage-blob
 
 COPY infra/scripts/pg-backup-azure.sh /usr/local/bin/pg-backup
+COPY infra/scripts/pg-restore-azure.sh /usr/local/bin/pg-restore
 COPY infra/scripts/az-blob.py         /usr/local/bin/az-blob
-RUN chmod +x /usr/local/bin/pg-backup /usr/local/bin/az-blob
+RUN chmod +x /usr/local/bin/pg-backup /usr/local/bin/pg-restore /usr/local/bin/az-blob
 
 # Run at 03:00 UTC every day
 RUN echo "0 3 * * * /usr/local/bin/pg-backup >> /var/log/pg-backup.log 2>&1" \

@@ -42,7 +42,7 @@ services:
     container_name: cloudatlas-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-cloudatlas}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cloudatlas_pass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}
       POSTGRES_DB: ${POSTGRES_DB:-cloudatlas_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -62,7 +62,7 @@ services:
       dockerfile: infra/docker/backend.prod.Dockerfile
     container_name: cloudatlas-backend
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:-cloudatlas_pass}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
       - SECRET_KEY=${SECRET_KEY:-changeme-use-openssl-rand-hex-32-in-production}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
       - 'ALLOWED_ORIGINS=["https://cloudatlas.app.br","https://www.cloudatlas.app.br","https://hub.cloudatlas.app.br","https://desk.cloudatlas.app.br","http://localhost","http://localhost:3000"]'
@@ -156,7 +156,7 @@ services:
     container_name: cloudatlas-migration-worker
     command: ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "migration", "--loglevel=info", "--concurrency=2"]
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:-cloudatlas_pass}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
       - SECRET_KEY=${SECRET_KEY:-changeme-use-openssl-rand-hex-32-in-production}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
       - REDIS_URL=redis://redis:6379/0
@@ -194,7 +194,7 @@ services:
       # PostgreSQL connection
       - PGHOST=postgres
       - PGUSER=${POSTGRES_USER:-cloudatlas}
-      - PGPASSWORD=${POSTGRES_PASSWORD:-cloudatlas_pass}
+      - PGPASSWORD=${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}
       - PGDATABASE=${POSTGRES_DB:-cloudatlas_db}
       # Azure Blob Storage — create a dedicated storage account for backups
       - AZURE_STORAGE_ACCOUNT=${BACKUP_AZURE_STORAGE_ACCOUNT:-}
@@ -226,14 +226,14 @@ services:
     container_name: cloudatlas-flower
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
-      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?defina FLOWER_PASSWORD em infra/.env}
       - SECRET_KEY=${SECRET_KEY}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:-cloudatlas_pass}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}
       - REDIS_URL=redis://redis:6379/0
       - DEBUG=False
     ports:
-      - "0.0.0.0:5555:5555"
+      - "127.0.0.1:5555:5555"
     networks:
       - cloudatlas-network
     depends_on:
@@ -259,7 +259,7 @@ services:
     image: prometheuscommunity/postgres-exporter:latest
     container_name: cloudatlas-postgres-exporter
     environment:
-      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:-cloudatlas_pass}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}?sslmode=disable"
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-cloudatlas}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD em infra/.env}@postgres:5432/${POSTGRES_DB:-cloudatlas_db}?sslmode=disable"
     networks:
       - cloudatlas-network
     depends_on:
@@ -272,7 +272,7 @@ services:
     image: prom/prometheus:latest
     container_name: cloudatlas-prometheus
     ports:
-      - "0.0.0.0:9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -294,10 +294,10 @@ services:
     image: grafana/grafana:latest
     container_name: cloudatlas-grafana
     ports:
-      - "0.0.0.0:3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?defina GRAFANA_PASSWORD em infra/.env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana_data:/var/lib/grafana
